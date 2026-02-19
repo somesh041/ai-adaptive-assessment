@@ -338,10 +338,19 @@ def _render_dashboard_tab() -> None:
     with c5:
         st.metric("Confidence (heuristic)", f"{confidence*100:.0f}%")
 
+    def _safe_plot(fig_fn, label: str):
+        try:
+            fig = fig_fn(sess)
+            st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
+        except Exception as e:
+            st.warning(f"{label} chart unavailable: {e}")
+
     st.markdown("#### Charts")
-    st.pyplot(make_theta_fig(sess), clear_figure=True)
-    st.pyplot(make_mastery_heatmap_fig(sess), clear_figure=True)
-    st.pyplot(make_difficulty_path_fig(sess), clear_figure=True)
+    _safe_plot(make_theta_fig, "Theta")
+    _safe_plot(make_mastery_heatmap_fig, "Mastery")
+    _safe_plot(make_difficulty_path_fig, "Difficulty path")
+
 
     st.markdown("#### Misconceptions")
     if not top_mis:
