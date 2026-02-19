@@ -1,20 +1,17 @@
 # AI-Driven Adaptive Assessment & Diagnostic Intelligence System (Streamlit)
 
-A production-ready Streamlit repo that demonstrates:
+This repo demonstrates a production-ready pipeline for:
 
-- **Item Bank Generator** (LLM-assisted, strict JSON, Pydantic validation + auto-repair)
-- **Adaptive Test Engine** (**NO LLM calls during quiz**)
-- **Diagnostic Dashboard** (theta, confidence heuristic, mastery heatmap, difficulty path, misconceptions)
-- **AI narrative + recommendations** (ONE LLM call)
-- **PDF export** (ReportLab)
+- **AI item generation** (OpenAI Responses API, strict JSON, Pydantic validation + auto-repair)
+- **Psychometric QC** (construct alignment checks + item-writing flaw detection + IRT priors + auto-regeneration)
+- **Optional Indian language translations** (Hindi/Marathi/Odia/Telugu) saved into the **same JSON**
+- **Adaptive test engine with NO LLM calls during quiz**
+  - IRT-based theta update (2PL/3PL-style)
+  - Cognitive mastery update using **BKT** (per-skill P(known))
+- **Diagnostic dashboard**
+- **PDF export**
 
----
-
-## 1) Local setup
-
-### Prereqs
-- Python 3.10+ (recommended 3.11)
-- An OpenAI API key
+## Local run
 
 ### Install
 ```bash

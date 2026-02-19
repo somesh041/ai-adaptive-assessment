@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Any, Dict, List
+from typing import Any, List
 
 
 DATA_DIR = "data"
@@ -16,9 +16,6 @@ def ensure_data_dirs() -> None:
 
 
 def save_json_atomic(path: str, payload: Any) -> None:
-    """
-    Atomic-ish write: write to temp, then replace.
-    """
     ensure_data_dirs()
     dirpath = os.path.dirname(path) or "."
     os.makedirs(dirpath, exist_ok=True)
@@ -47,5 +44,5 @@ def list_session_files() -> List[str]:
     for fn in os.listdir(SESSIONS_DIR):
         if fn.lower().endswith(".json"):
             files.append(os.path.join(SESSIONS_DIR, fn))
-    files.sort(reverse=True)  # newest first by filename timestamp
+    files.sort(reverse=True)
     return files

@@ -16,7 +16,6 @@ def get_openai_api_key() -> str:
     try:
         key = st.secrets.get("OPENAI_API_KEY", "")  # type: ignore[attr-defined]
     except Exception:
-        # Not running in Streamlit or secrets not configured
         key = ""
 
     if not key:
@@ -24,7 +23,6 @@ def get_openai_api_key() -> str:
 
     if not key:
         raise RuntimeError("OPENAI_API_KEY not found in Streamlit secrets or environment variables.")
-
     return key
 
 
