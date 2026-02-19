@@ -38,7 +38,7 @@ distractor_misconceptions (array of 4 strings) where:
   - every wrong option MUST have a non-empty misconception label (short phrase)
 
 Constraints:
-- IDs must be unique and stable-looking, like "{topic_slug}-{i:03d}" with i starting at 1.
+- IDs must be unique and stable-looking, like "{topic_slug}-001", "{topic_slug}-002", ... with numbering starting at 1.
 - Exactly 4 options; only one correct.
 - Avoid ambiguity, avoid trick questions.
 - explanation_short must be <= 240 characters (hard limit).
@@ -87,7 +87,10 @@ def _call_itembank_llm(topic: str, grade: str, skills: List[str], n_items: int, 
         max_output_tokens=3200,
     )
     try:
-        kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": "ItemBank", "schema": schema_obj, "strict": True}}
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "ItemBank", "schema": schema_obj, "strict": True},
+        }
     except Exception:
         pass
 
@@ -146,7 +149,14 @@ def generate_or_load_item_bank(
     ensure_data_dirs()
 
     cache_key = stable_hash(
-        {"topic": topic, "grade": grade, "skills": skills, "n_items": n_items, "model": model, "schema": "Item-v3-psychometrics"}
+        {
+            "topic": topic,
+            "grade": grade,
+            "skills": skills,
+            "n_items": n_items,
+            "model": model,
+            "schema": "Item-v3-psychometrics",
+        }
     )
     path = os.path.join("data", f"itembank_{cache_key}.json")
 
