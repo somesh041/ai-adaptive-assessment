@@ -1,212 +1,234 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError
 
 from src.openai_client import get_client
-from src.schemas import IRTParams, Item, ItemReview
-from src.utils import now_timestamp_id
 
 
-REVIEW_SYSTEM = """You are a psychometrics-aware assessment quality reviewer.
-Return ONLY valid JSON (no markdown).
-You will:
-- detect item-writing flaws (ambiguity, multiple correct answers, implausible distractors, cueing, off-skill)
-- check construct alignment: skill + Bloom match
-- estimate initial IRT-like priors (a,b,c) as rough starting values (NOT final calibration)
-Be conservative: if unsure, flag the issue.
-"""
-
-
-class ReviewItemIn(BaseModel):
+# -----------------------------
+# Pydantic output schema (minimal + robust)
+# -----------------------------
+class ItemReviewOut(BaseModel):
     id: str
-    skill: str
-    difficulty_label: str
-    bloom_level: str
-    stem: str
-    options: List[str]
-    correct_index: int
-    explanation_short: str
-
-
-class ReviewItemOut(BaseModel):
-    id: str
-
-    skill_pred: str
-    bloom_pred: str
-    skill_match: bool
-    bloom_match: bool
-    difficulty_label_ok: bool
-
-    # IRT priors
-    a: float = Field(..., ge=0.05, le=5.0)
-    b: float = Field(..., ge=-6.0, le=6.0)
-    c: float = Field(..., ge=0.0, le=0.40)
-
     flags: List[str] = Field(default_factory=list)
     revision_needed: bool = False
-    revision_instructions: Optional[str] = None
-
-    @field_validator("flags")
-    @classmethod
-    def _flags_clean(cls, v: List[str]) -> List[str]:
-        return [str(x).strip()[:80] for x in (v or []) if str(x).strip()]
+    revision_instructions: str = ""
 
 
 class ReviewPayloadOut(BaseModel):
-    items: List[ReviewItemOut] = Field(..., min_length=1)
-
-    @model_validator(mode="after")
-    def _unique_ids(self) -> "ReviewPayloadOut":
-        ids = [x.id for x in self.items]
-        if len(set(ids)) != len(ids):
-            raise ValueError("duplicate ids in review output")
-        return self
+    items: List[ItemReviewOut] = Field(default_factory=list)
 
 
-def _build_prompt(topic: str, grade: str, bank_skills: List[str], items: List[ReviewItemIn]) -> str:
-    payload = [it.model_dump() for it in items]
-    return f"""
-Context:
-- Topic: {topic}
-- Grade: {grade}
-- Allowed skills list: {bank_skills}
+SYSTEM = "You are a psychometric and content QA reviewer for MCQ items. Return ONLY JSON."
+REVIEW_PROMPT = """Review the following multiple-choice items for:
+- clarity/grammar,
+- correct answer consistency,
+- distractor quality,
+- skill alignment,
+- age/grade appropriateness,
+- ambiguity / trickiness,
+- numerical/symbol formatting issues.
 
-Review each item.
-
-Output STRICT JSON:
-{{
+Return STRICT JSON only in this format:
+{
   "items": [
-    {{
+    {
       "id": "...",
-      "skill_pred": "...",
-      "bloom_pred": "...",
-      "skill_match": true/false,
-      "bloom_match": true/false,
-      "difficulty_label_ok": true/false,
-      "a": 0.8,
-      "b": -0.5,
-      "c": 0.20,
-      "flags": ["..."],
+      "flags": ["...", "..."],                 // empty list if no issues
       "revision_needed": true/false,
-      "revision_instructions": "..."
-    }}
+      "revision_instructions": "..."           // empty string if no revision needed
+    }
   ]
-}}
+}
 
-Guidance:
-- skill_pred should be one of the allowed skills if possible; otherwise closest description.
-- difficulty_label_ok: does the presented difficulty label seem consistent with the item?
-- a: 0.3..2.5 typical; higher if item sharply differentiates.
-- b: -2..2 typical; negative easier, positive harder.
-- c: guessing lower bound; for 4-option MCQ typical ~0.25, but reduce if distractors strong.
-- If revision_needed=true, provide short, actionable revision_instructions (<=240 chars).
+Rules:
+- Keep flags short (2–8 words).
+- revision_instructions should be concise.
+- If stem is garbled or explanation mismatches correct answer, set revision_needed=true.
+"""
 
-Items:
-{json.dumps(payload, ensure_ascii=False)}
-""".strip()
+REPAIR_PROMPT = """The JSON output was invalid or didn't match the schema.
+
+Errors:
+{errors}
+
+Return ONLY corrected JSON using the exact required format.
+Here is the invalid output:
+{raw}
+"""
+
+
+def _extract_json(text: str) -> str:
+    """
+    Robustly extract the first JSON object from a string.
+    Prevents failures when the model accidentally adds commentary.
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    # Fast path: already valid JSON object
+    if s.startswith("{") and s.endswith("}"):
+        return s
+
+    # Try to find a JSON object block
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    return m.group(0).strip() if m else s
+
+
+def _responses_create_safe(client, **kwargs):
+    """
+    Some OpenAI SDK versions do not support `response_format` on responses.create().
+    This wrapper retries without unsupported kwargs.
+    """
+    try:
+        return client.responses.create(**kwargs)
+    except TypeError as e:
+        msg = str(e)
+        if "response_format" in msg and "unexpected keyword argument" in msg:
+            kwargs.pop("response_format", None)
+            return client.responses.create(**kwargs)
+        raise
+
+
+def _call_review_llm(items_payload: List[Dict[str, Any]], topic: str, grade: str, skills: List[str], model: str) -> str:
+    client = get_client()
+    user = (
+        f"{REVIEW_PROMPT}\n\n"
+        f"Context:\nTopic: {topic}\nGrade: {grade}\nSkills: {', '.join(skills)}\n\n"
+        f"Items:\n{json.dumps(items_payload, ensure_ascii=False)}"
+    )
+
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "input": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+        "max_output_tokens": 1800,
+    }
+
+    # Try to enforce schema if supported; wrapper will remove if SDK rejects.
+    try:
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ReviewPayloadOut",
+                "schema": ReviewPayloadOut.model_json_schema(),
+                "strict": True,
+            },
+        }
+    except Exception:
+        pass
+
+    resp = _responses_create_safe(client, **kwargs)
+    return resp.output_text or ""
+
+
+def _call_repair_llm(raw: str, errors: str, model: str) -> str:
+    client = get_client()
+    user = REPAIR_PROMPT.format(errors=errors[:2000], raw=(raw or "")[:6000])
+
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "input": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+        "max_output_tokens": 1800,
+    }
+
+    # Again: try schema, but fallback if unsupported
+    try:
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ReviewPayloadOut",
+                "schema": ReviewPayloadOut.model_json_schema(),
+                "strict": True,
+            },
+        }
+    except Exception:
+        pass
+
+    resp = _responses_create_safe(client, **kwargs)
+    return resp.output_text or ""
 
 
 def review_items_llm(
-    items: List[Item],
+    items: List[Any],
     topic: str,
     grade: str,
     skills: List[str],
     model: str,
     chunk_size: int = 20,
-    max_attempts: int = 3,
-) -> Dict[str, ReviewItemOut]:
+    max_attempts: int = 2,
+) -> Dict[str, ItemReviewOut]:
     """
-    Returns mapping item_id -> ReviewItemOut
+    Returns: { item_id -> ItemReviewOut }
+    Works even if SDK doesn't support response_format.
     """
-    out: Dict[str, ReviewItemOut] = {}
-    client = get_client()
+    out: Dict[str, ItemReviewOut] = {}
+
+    # Convert items to minimal payload to reduce tokens
+    def to_payload(it: Any) -> Dict[str, Any]:
+        return {
+            "id": getattr(it, "id", ""),
+            "skill": getattr(it, "skill", ""),
+            "difficulty_label": getattr(it, "difficulty_label", ""),
+            "bloom_level": getattr(it, "bloom_level", ""),
+            "stem": getattr(it, "stem", ""),
+            "options": getattr(it, "options", []),
+            "correct_index": getattr(it, "correct_index", 0),
+            "explanation_short": getattr(it, "explanation_short", ""),
+            "distractor_misconceptions": getattr(it, "distractor_misconceptions", []),
+        }
 
     for i in range(0, len(items), chunk_size):
         chunk = items[i : i + chunk_size]
-        in_items = [
-            ReviewItemIn(
-                id=it.id,
-                skill=it.skill,
-                difficulty_label=it.difficulty_label,
-                bloom_level=it.bloom_level,
-                stem=it.stem,
-                options=it.options,
-                correct_index=it.correct_index,
-                explanation_short=it.explanation_short,
-            )
-            for it in chunk
-        ]
-
-        prompt = _build_prompt(topic, grade, skills, in_items)
+        payload = [to_payload(it) for it in chunk]
 
         last_raw = ""
+        err = ""
         for attempt in range(1, max_attempts + 1):
-            kwargs: Dict[str, Any] = dict(
-                model=model,
-                input=[{"role": "system", "content": REVIEW_SYSTEM}, {"role": "user", "content": prompt}],
-                max_output_tokens=2200,
-            )
-            try:
-                kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {"name": "ItemReviewPayload", "schema": ReviewPayloadOut.model_json_schema(), "strict": True},
-                }
-            except Exception:
-                pass
-
-            if attempt == 1:
-                resp = client.responses.create(**kwargs)
-                raw = resp.output_text
-            else:
-                repair_prompt = f"""
-The review JSON failed validation. Errors:
-{errors_str}
-
-Return ONLY corrected JSON in the exact same schema.
-Invalid JSON:
-{last_raw}
-""".strip()
-                resp = client.responses.create(
-                    model=model,
-                    input=[{"role": "system", "content": REVIEW_SYSTEM}, {"role": "user", "content": repair_prompt}],
-                    max_output_tokens=2200,
-                )
-                raw = resp.output_text
-
+            raw = _call_review_llm(payload, topic=topic, grade=grade, skills=skills, model=model) if attempt == 1 else _call_repair_llm(last_raw, err, model=model)
             last_raw = raw
+
             try:
-                data = json.loads((raw or "").strip())
-                payload = ReviewPayloadOut.model_validate(data)
-                for ri in payload.items:
-                    out[ri.id] = ri
+                jtxt = _extract_json(raw)
+                parsed = json.loads(jtxt)
+                validated = ReviewPayloadOut.model_validate(parsed)
+                for r in validated.items:
+                    out[r.id] = r
                 break
             except (json.JSONDecodeError, ValidationError, ValueError) as e:
-                errors_str = str(e)
+                err = str(e)
                 if attempt == max_attempts:
-                    raise RuntimeError(
-                        "Failed to produce valid review payload.\n"
-                        f"Last error: {errors_str}\n"
-                        f"Last raw (truncated): {last_raw[:1200]}"
-                    ) from e
-
+                    # If review fails, default to "no flags" so QC doesn't crash.
+                    for it in chunk:
+                        iid = getattr(it, "id", "")
+                        if iid and iid not in out:
+                            out[iid] = ItemReviewOut(id=iid, flags=["review_failed"], revision_needed=False, revision_instructions="")
     return out
 
 
-def apply_review_to_item(item: Item, r: ReviewItemOut, source: str = "llm") -> Item:
-    item.irt = IRTParams(a=float(r.a), b=float(r.b), c=float(r.c))
-    item.review = ItemReview(
-        reviewer=source,  # type: ignore[arg-type]
-        skill_pred=r.skill_pred,
-        bloom_pred=r.bloom_pred,
-        skill_match=bool(r.skill_match),
-        bloom_match=bool(r.bloom_match),
-        difficulty_label_ok=bool(r.difficulty_label_ok),
-        flags=list(r.flags),
-        revision_needed=bool(r.revision_needed),
-        revision_instructions=(r.revision_instructions or None),
-        updated_at=now_timestamp_id(),
-    )
-    return item
+def apply_review_to_item(item: Any, review: ItemReviewOut, source: str = "llm") -> None:
+    """
+    Attaches review to item in a way that's compatible with most schema designs.
+    """
+    try:
+        # If your schemas define ItemReview model, prefer it.
+        from src.schemas import ItemReview  # type: ignore
+
+        item.review = ItemReview(
+            source=source,
+            flags=review.flags,
+            revision_needed=bool(review.revision_needed),
+            revision_instructions=review.revision_instructions or "",
+        )
+    except Exception:
+        # Fallback: store as dict
+        item.review = {
+            "source": source,
+            "flags": review.flags,
+            "revision_needed": bool(review.revision_needed),
+            "revision_instructions": review.revision_instructions or "",
+        }

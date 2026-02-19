@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import os
-from typing import List
+import zipfile
+from typing import List, Optional
 
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -47,8 +49,17 @@ def _init_state() -> None:
     st.session_state.setdefault("qc_enabled", True)
 
 
+def _zip_files(paths: List[str]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in paths:
+            z.write(p, arcname=os.path.join("sessions", os.path.basename(p)))
+    buf.seek(0)
+    return buf.read()
+
+
 def _render_generate_tab() -> None:
-    st.subheader("1) Item Bank Generator + Psychometric QC")
+    st.subheader("1) Item Bank Generator")
 
     colA, colB = st.columns([2, 1])
     with colA:
@@ -59,14 +70,14 @@ def _render_generate_tab() -> None:
             value="place value, comparing decimals, fraction equivalence, converting fractions to decimals",
         )
 
-        st.markdown("##### Robustness (recommended)")
+        st.markdown("##### Robustness")
         st.session_state.qc_enabled = st.checkbox(
-            "Psychometric QC (validity checks + IRT priors + auto-regeneration)",
+            "Enable Psychometric QC (review + auto-regenerate bad items)",
             value=st.session_state.qc_enabled,
-            help="Adds extra LLM calls for review/repair. Turn off to minimize cost.",
+            help="Adds extra model calls. Turn off for cheapest runs.",
         )
 
-        st.markdown("##### Optional: Add translations (off by default to minimize cost)")
+        st.markdown("##### Optional translations (OFF by default)")
         enable_i18n = st.checkbox("Generate translations", value=False)
         langs_selected: List[LangCode] = []
         if enable_i18n:
@@ -81,11 +92,6 @@ def _render_generate_tab() -> None:
     with colB:
         st.session_state.model = st.text_input("OpenAI model", value=st.session_state.model)
         n_items = st.number_input("Number of items", min_value=5, max_value=200, value=30, step=5)
-
-    st.caption(
-        "Flow: Generate → Pydantic validate/repair → (optional) Psychometric QC & auto-regenerate bad items → "
-        "(optional) add translations. Saved in one cached JSON under data/."
-    )
 
     if st.button("Generate / Load Item Bank", type="primary", use_container_width=True):
         if not _get_openai_key_present():
@@ -112,8 +118,8 @@ def _render_generate_tab() -> None:
         st.session_state.item_bank_path = path
         st.success(f"Item bank ready: {path}")
 
-    if st.session_state.item_bank is None or st.session_state.item_bank_path is None:
-        st.markdown("#### Load an existing item bank")
+    if st.session_state.item_bank is None:
+        st.info("Generate or upload an item bank to proceed.")
         uploaded = st.file_uploader("Upload item bank JSON", type=["json"])
         if uploaded is not None:
             try:
@@ -131,50 +137,26 @@ def _render_generate_tab() -> None:
         return
 
     bank: ItemBank = st.session_state.item_bank
-    path: str = st.session_state.item_bank_path
-
     st.markdown("#### Bank summary")
-    metrics = bank_summary_metrics(bank)
-    st.json(metrics)
+    st.json(bank_summary_metrics(bank))
 
     st.markdown("#### Preview (first 2 items)")
     st.json([i.model_dump() for i in bank.items[:2]])
 
-    any_translated = any(bool(it.translations) for it in bank.items)
-    if any_translated:
-        st.markdown("#### Translation preview")
-        lang = st.selectbox(
-            "Preview language",
-            options=["en"] + list(LANG_LABELS.keys()),
-            format_func=lambda c: "English" if c == "en" else LANG_LABELS[c],  # type: ignore[index]
-        )
-        it0 = bank.items[0]
-        if lang == "en":
-            st.write("**Stem:**", it0.stem)
-            for i, opt in enumerate(it0.options):
-                st.write(f"{chr(65+i)}. {opt}")
-        else:
-            t = (it0.translations or {}).get(lang)  # type: ignore[arg-type]
-            if not t:
-                st.info("This item does not have the selected translation yet.")
-            else:
-                st.write("**Stem:**", t.stem)
-                for i, opt in enumerate(t.options):
-                    st.write(f"{chr(65+i)}. {opt}")
-
-    st.markdown("#### Download")
-    with open(path, "rb") as f:
-        st.download_button(
-            "Download item bank JSON",
-            data=f.read(),
-            file_name=os.path.basename(path),
-            mime="application/json",
-            use_container_width=True,
-        )
+    path = st.session_state.item_bank_path
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            st.download_button(
+                "Download item bank JSON",
+                data=f.read(),
+                file_name=os.path.basename(path),
+                mime="application/json",
+                use_container_width=True,
+            )
 
 
 def _render_test_tab() -> None:
-    st.subheader("2) Adaptive Test Engine (No LLM calls during quiz)")
+    st.subheader("2) Adaptive Test (NO LLM calls during quiz)")
 
     if st.session_state.item_bank is None:
         st.info("Generate or load an item bank first (Generate tab).")
@@ -183,7 +165,7 @@ def _render_test_tab() -> None:
     bank: ItemBank = st.session_state.item_bank
 
     st.session_state.active_test_total = int(
-        st.slider("Number of questions in this test", min_value=5, max_value=40, value=15, step=1)
+        st.slider("Number of questions in this test", min_value=5, max_value=40, value=5, step=1)
     )
 
     available_langs: List[str] = ["en"]
@@ -217,14 +199,24 @@ def _render_test_tab() -> None:
 
     sess: AdaptiveSession = st.session_state.adaptive
 
+    # finished: save + download (Streamlit Cloud storage is ephemeral)
     if sess.is_finished:
         ensure_data_dirs()
         out_path = os.path.join("data", "sessions", f"{sess.session_id}.json")
         save_json_atomic(out_path, sess.to_json_dict())
         st.session_state.latest_session_path = out_path
-        st.success("Test completed and saved.")
-        st.code(out_path)
-        st.info("Go to **Dashboard** tab to view diagnostics and export a PDF report.")
+
+        st.success("Test completed and saved (runtime storage).")
+        st.caption("Streamlit Cloud won’t push these files to GitHub automatically; download them below.")
+
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "Download this session JSON",
+                data=f.read(),
+                file_name=os.path.basename(out_path),
+                mime="application/json",
+                use_container_width=True,
+            )
         return
 
     next_item = select_next_item(sess, bank)
@@ -248,23 +240,40 @@ def _render_test_tab() -> None:
     )
     st.write(stem)
 
-    choice = st.radio(
-        "Choose an option:",
-        options=list(range(4)),
-        format_func=lambda idx: f"{chr(65 + idx)}. {options[idx]}",
-        key=f"choice_{sess.step_index}",
-    )
+    # FIX: no preselected option (all circles same until user clicks)
+    radio_key = f"choice_{sess.step_index}"
+    choice: Optional[int]
+    try:
+        choice = st.radio(
+            "Choose an option:",
+            options=list(range(4)),
+            index=None,
+            format_func=lambda idx: f"{chr(65 + idx)}. {options[idx]}",
+            key=radio_key,
+        )
+    except TypeError:
+        # older streamlit fallback
+        choice = st.radio(
+            "Choose an option:",
+            options=list(range(4)),
+            format_func=lambda idx: f"{chr(65 + idx)}. {options[idx]}",
+            key=radio_key,
+        )
 
     if st.button("Submit answer", type="primary", use_container_width=True):
+        if choice is None:
+            st.warning("Please select an option before submitting.")
+            st.stop()
+
         was_correct = int(choice) == int(next_item.correct_index)
         sess.apply_answer(item=next_item, chosen_index=int(choice), was_correct=was_correct)
-        st.toast("Correct ✅" if was_correct else "Incorrect ❌")
 
         ensure_data_dirs()
         out_path = os.path.join("data", "sessions", f"{sess.session_id}.json")
         save_json_atomic(out_path, sess.to_json_dict())
         st.session_state.latest_session_path = out_path
 
+        st.toast("Correct ✅" if was_correct else "Incorrect ❌")
         with st.expander("Explanation (English)", expanded=not was_correct):
             st.write(next_item.explanation_short)
 
@@ -273,7 +282,7 @@ def _render_test_tab() -> None:
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Theta (IRT)", f"{sess.theta:.2f}")
+        st.metric("Theta", f"{sess.theta:.2f}")
     with c2:
         st.metric("SEM", f"{sess.theta_sem:.2f}")
     with c3:
@@ -281,18 +290,24 @@ def _render_test_tab() -> None:
     with c4:
         st.metric("Accuracy", f"{(sess.correct_count / max(1, len(sess.answers)) * 100):.0f}%")
 
-    if st.checkbox("Show mastery (live)", value=False):
-        st.json(sess.mastery)
-
 
 def _render_dashboard_tab() -> None:
-    st.subheader("3) Diagnostic Dashboard + Calibration")
+    st.subheader("3) Diagnostic Dashboard")
 
     ensure_data_dirs()
     session_files = list_session_files()
     if not session_files:
         st.info("No saved sessions yet. Complete a test in the Test tab.")
         return
+
+    # Download all sessions ZIP (for Streamlit Cloud demo)
+    st.download_button(
+        "Download all sessions (ZIP)",
+        data=_zip_files(session_files),
+        file_name="sessions.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
 
     default_path = (
         st.session_state.latest_session_path if st.session_state.latest_session_path in session_files else session_files[0]
@@ -308,6 +323,7 @@ def _render_dashboard_tab() -> None:
     sess = AdaptiveSession.from_json_dict(sess_data)
 
     confidence = compute_confidence_heuristic(sess)
+    top_mis = summarize_misconceptions(sess, top_k=8)
 
     st.markdown("#### Summary")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -316,7 +332,7 @@ def _render_dashboard_tab() -> None:
     with c2:
         st.metric("SEM", f"{sess.theta_sem:.2f}")
     with c3:
-        st.metric("Reliability (IRT heuristic)", f"{sess.reliability_heuristic*100:.0f}%")
+        st.metric("Reliability (heuristic)", f"{sess.reliability_heuristic*100:.0f}%")
     with c4:
         st.metric("Answered", len(sess.answers))
     with c5:
@@ -328,23 +344,21 @@ def _render_dashboard_tab() -> None:
     st.pyplot(make_difficulty_path_fig(sess), clear_figure=True)
 
     st.markdown("#### Misconceptions")
-    top_mis = summarize_misconceptions(sess, top_k=8)
     if not top_mis:
         st.info("No misconception signals yet.")
     else:
         st.table([{"misconception": k, "count": v} for k, v in top_mis])
 
     st.markdown("---")
-    st.subheader("AI Narrative & Recommendations (1 LLM call)")
+    st.subheader("AI Narrative & Recommendations (ONE LLM call)")
 
     if not _get_openai_key_present():
         st.warning("OpenAI API key not found. Set env var OPENAI_API_KEY or Streamlit secret OPENAI_API_KEY.")
         return
 
-    if sess.ai_insights is None:
-        st.caption("Generates ≤160-word narrative + exactly 5 bullet recommendations.")
-        if st.button("Generate AI insights", type="primary", use_container_width=True):
-            with st.spinner("Generating AI insights..."):
+    if st.button("Generate AI insights", type="primary", use_container_width=True):
+        with st.spinner("Generating AI insights..."):
+            try:
                 ai = generate_ai_insights_one_call(
                     sess=sess,
                     model=st.session_state.model,
@@ -353,27 +367,29 @@ def _render_dashboard_tab() -> None:
                 )
                 sess.ai_insights = ai
                 save_json_atomic(selected, sess.to_json_dict())
-                st.rerun()
-        else:
-            st.info("Click to generate AI insights for this session.")
-            return
+                st.success("AI insights generated.")
+            except Exception as e:
+                st.error(f"AI insights failed: {e}")
 
-    st.markdown("#### Narrative")
-    st.write(sess.ai_insights["narrative"])
-    st.markdown("#### Recommendations")
-    for b in sess.ai_insights["recommendations"]:
-        st.markdown(f"- {b}")
+    if sess.ai_insights:
+        st.markdown("#### Narrative")
+        st.write(sess.ai_insights["narrative"])
+        st.markdown("#### Recommendations")
+        for b in sess.ai_insights["recommendations"]:
+            st.markdown(f"- {b}")
+    else:
+        st.info("Click **Generate AI insights** to create narrative + recommendations.")
 
     st.markdown("---")
-    st.subheader("Bank-level information curve (uses stored item IRT priors / calibration)")
+    st.subheader("Bank-level information curve")
     if st.session_state.item_bank is not None:
         st.pyplot(make_bank_info_curve_fig(st.session_state.item_bank), clear_figure=True)
     else:
-        st.info("Load/generate an item bank to view bank-level psychometrics.")
+        st.info("Load/generate an item bank to view bank-level metrics.")
 
     st.markdown("---")
-    st.subheader("Optional: Empirical calibration (JML) from saved sessions")
-    st.caption("Uses response data from multiple sessions; updates item a/b parameters. No LLM calls.")
+    st.subheader("Optional: Empirical calibration (2PL JML) from saved sessions")
+    st.caption("No LLM calls. Needs multiple sessions to be meaningful.")
     if st.session_state.item_bank is None:
         st.info("Load/generate an item bank first.")
     else:
@@ -387,15 +403,12 @@ def _render_dashboard_tab() -> None:
             st.json(calib_report)
 
     st.markdown("---")
-    st.subheader("4) Export PDF Report")
-
+    st.subheader("Export PDF Report")
     figs = {
         "theta": make_theta_fig(sess),
         "mastery": make_mastery_heatmap_fig(sess),
         "difficulty": make_difficulty_path_fig(sess),
     }
-
-    report_name = f"adaptive_report_{os.path.basename(selected).replace('.json','')}.pdf"
 
     if st.button("Generate PDF", type="primary", use_container_width=True):
         with st.spinner("Building PDF report..."):
@@ -409,7 +422,7 @@ def _render_dashboard_tab() -> None:
         st.download_button(
             "Download PDF report",
             data=pdf_bytes,
-            file_name=report_name,
+            file_name=f"adaptive_report_{os.path.basename(selected).replace('.json','')}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
@@ -424,7 +437,7 @@ def main() -> None:
 
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Item generation + optional translations + psychometric QC + adaptive IRT test + cognitive mastery + PDF export.")
+    st.caption("Item generation + translations + psychometric QC + adaptive IRT test + dashboard + PDF export.")
 
     with st.expander("System status", expanded=False):
         st.write(

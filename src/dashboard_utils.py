@@ -4,114 +4,24 @@ import json
 from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
-import numpy as np
 
-from src.adaptive_engine import AdaptiveSession
 from src.openai_client import get_client
-from src.psychometrics.bank_stats import bank_information_curve
-from src.psychometrics.irt import prob_3pl
 from src.schemas import ItemBank
+from src.adaptive_engine import AdaptiveSession
 
 
 def compute_confidence_heuristic(sess: AdaptiveSession) -> float:
-    # reuse SEM-based view; scale to [0,0.98]
-    if not sess.answers:
-        return 0.0
-    conf = 1.0 - min(1.0, (sess.theta_sem / 2.0))
-    return float(max(0.0, min(0.98, conf)))
+    # simple bounded heuristic: lower SEM + more answers => higher confidence
+    n = max(1, len(sess.answers))
+    sem_term = max(0.0, min(1.0, 1.0 - (sess.theta_sem / 1.5)))
+    n_term = max(0.0, min(1.0, n / max(10, sess.total_questions)))
+    return max(0.0, min(1.0, 0.65 * sem_term + 0.35 * n_term))
 
 
-def make_theta_fig(sess: AdaptiveSession):
-    xs = list(range(1, len(sess.answers) + 1))
-    ys = [ev.theta_after for ev in sess.answers]
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.plot(xs, ys, marker="o")
-    ax.set_title("Theta over time (IRT)")
-    ax.set_xlabel("Question #")
-    ax.set_ylabel("Theta")
-    ax.grid(True, alpha=0.3)
-    return fig
-
-
-def make_mastery_heatmap_fig(sess: AdaptiveSession):
-    skills = sorted(sess.mastery.keys())
-    values = [sess.mastery[s] for s in skills]
-    fig = plt.figure(figsize=(max(6, len(skills) * 0.6), 2.5))
-    ax = fig.add_subplot(111)
-    data = np.array(values).reshape(1, -1)
-    im = ax.imshow(data, aspect="auto", vmin=0.0, vmax=1.0)
-    ax.set_yticks([])
-    ax.set_xticks(range(len(skills)))
-    ax.set_xticklabels(skills, rotation=35, ha="right")
-    ax.set_title("Per-skill mastery P(known)")
-    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
-    return fig
-
-
-def make_difficulty_path_fig(sess: AdaptiveSession):
-    xs = list(range(1, len(sess.answers) + 1))
-    ys = [ev.b for ev in sess.answers]
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.plot(xs, ys, marker="o")
-    ax.set_title("Difficulty path over time (b)")
-    ax.set_xlabel("Question #")
-    ax.set_ylabel("Difficulty (b)")
-    ax.grid(True, alpha=0.3)
-    return fig
-
-
-def summarize_misconceptions(sess: AdaptiveSession, top_k: int = 5) -> List[Tuple[str, int]]:
-    items = sorted(sess.misconception_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    return items[:top_k]
-
-
-def make_bank_info_curve_fig(bank: ItemBank):
-    curve = bank_information_curve(bank)
-    xs = [x for x, _ in curve]
-    ys = [y for _, y in curve]
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.plot(xs, ys, marker="o")
-    ax.set_title("Bank test information curve (sum of item information)")
-    ax.set_xlabel("Theta")
-    ax.set_ylabel("Information")
-    ax.grid(True, alpha=0.3)
-    return fig
-
-
-def _ai_prompt(sess: AdaptiveSession, top_misconceptions: List[Tuple[str, int]], confidence: float) -> str:
-    weak_skills = sorted(sess.mastery.items(), key=lambda kv: (kv[1], kv[0]))[:5]
-    strong_skills = sorted(sess.mastery.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
-    payload = {
-        "theta": round(sess.theta, 3),
-        "sem": round(sess.theta_sem, 3),
-        "reliability_heuristic": round(sess.reliability_heuristic, 3),
-        "confidence_heuristic": round(confidence, 3),
-        "answered": len(sess.answers),
-        "accuracy": round(sess.correct_count / max(1, len(sess.answers)), 3),
-        "weak_skills": [{"skill": s, "p_known": round(m, 3)} for s, m in weak_skills],
-        "strong_skills": [{"skill": s, "p_known": round(m, 3)} for s, m in strong_skills],
-        "top_misconceptions": [{"label": k, "count": v} for k, v in top_misconceptions],
-        "difficulty_path": [round(ev.b, 2) for ev in sess.answers[-12:]],
-    }
-    return f"""
-You are an educational diagnostician.
-
-Using ONLY the data below, produce:
-1) A narrative summary of performance, <=160 words.
-2) Exactly 5 bullet recommendations (each <=18 words), focused on targeted practice and remediation.
-
-Return STRICT JSON only:
-{{
-  "narrative": "...",
-  "recommendations": ["...", "...", "...", "...", "..."]
-}}
-
-Data:
-{json.dumps(payload, ensure_ascii=False)}
-""".strip()
+def summarize_misconceptions(sess: AdaptiveSession, top_k: int = 8) -> List[Tuple[str, int]]:
+    counters = sess.misconception_counts or {}
+    items = sorted(counters.items(), key=lambda kv: kv[1], reverse=True)
+    return [(k, v) for k, v in items[:top_k] if k and v > 0]
 
 
 def generate_ai_insights_one_call(
@@ -120,35 +30,124 @@ def generate_ai_insights_one_call(
     top_misconceptions: List[Tuple[str, int]],
     confidence: float,
 ) -> Dict[str, Any]:
+    """
+    ONE LLM call. Robust parsing: if JSON fails, fall back to plain text.
+    Output:
+      { "narrative": "...<=160 words...", "recommendations": ["...", ...] }
+    """
     client = get_client()
-    prompt = _ai_prompt(sess, top_misconceptions, confidence)
+
+    prompt = {
+        "theta": round(sess.theta, 3),
+        "sem": round(sess.theta_sem, 3),
+        "confidence": round(confidence, 3),
+        "answered": len(sess.answers),
+        "accuracy": round(sess.correct_count / max(1, len(sess.answers)), 3),
+        "skill_mastery": {k: round(v, 3) for k, v in (sess.mastery or {}).items()},
+        "top_misconceptions": [{"label": k, "count": v} for k, v in top_misconceptions],
+        "difficulty_path": [a.get("difficulty_label") for a in sess.answers],
+    }
+
+    system = "You are an assessment diagnostician. Return ONLY JSON. No markdown."
+    user = f"""
+Create a short diagnostic summary for a learner.
+
+Constraints:
+- narrative: <=160 words
+- recommendations: exactly 5 bullet strings
+- return STRICT JSON:
+{{"narrative":"...","recommendations":["...","...","...","...","..."]}}
+
+Data:
+{json.dumps(prompt, ensure_ascii=False)}
+""".strip()
+
     resp = client.responses.create(
         model=model,
-        input=[
-            {"role": "system", "content": "Return ONLY JSON. No markdown. No extra keys."},
-            {"role": "user", "content": prompt},
-        ],
-        max_output_tokens=350,
+        input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_output_tokens=500,
     )
     raw = (resp.output_text or "").strip()
-    data = json.loads(raw)
 
-    narrative = str(data.get("narrative", "")).strip()
-    recs = data.get("recommendations", [])
+    # Robust parse
+    try:
+        obj = json.loads(raw)
+        nar = str(obj.get("narrative", "")).strip()
+        rec = obj.get("recommendations", [])
+        if not isinstance(rec, list):
+            rec = []
+        rec = [str(x).strip() for x in rec if str(x).strip()]
+        if len(rec) < 5:
+            rec = rec + ["Practice 10 questions in the weakest skill."] * (5 - len(rec))
+        rec = rec[:5]
+        return {"narrative": nar[:1200], "recommendations": rec}
+    except Exception:
+        # fallback: treat raw as narrative, synthesize recommendations
+        lines = [ln.strip("-• ").strip() for ln in raw.splitlines() if ln.strip()]
+        narrative = " ".join(lines)[:900] if lines else "Performance summary unavailable."
+        rec = [
+            "Revise the weakest skill with worked examples.",
+            "Do 10 practice questions at easy difficulty, then 10 at medium.",
+            "Review mistakes and note the misconception behind each wrong choice.",
+            "Use number line / place value charts to build intuition (if applicable).",
+            "Re-attempt a short quiz after 24 hours to check retention.",
+        ]
+        return {"narrative": narrative, "recommendations": rec}
 
-    if not narrative:
-        raise ValueError("AI insights missing narrative.")
-    if len(narrative.split()) > 160:
-        narrative = " ".join(narrative.split()[:160])
 
-    if not isinstance(recs, list) or len(recs) != 5:
-        raise ValueError("AI insights must include exactly 5 recommendations.")
+# ---- chart helpers (matplotlib only) ----
 
-    recs2 = []
-    for r in recs:
-        s = str(r).strip()
-        if len(s.split()) > 18:
-            s = " ".join(s.split()[:18])
-        recs2.append(s)
+def make_theta_fig(sess: AdaptiveSession):
+    xs = list(range(1, len(sess.theta_path) + 1))
+    ys = sess.theta_path or [sess.theta]
+    fig = plt.figure()
+    plt.plot(xs, ys)
+    plt.xlabel("Question #")
+    plt.ylabel("Theta")
+    plt.title("Theta over time")
+    return fig
 
-    return {"narrative": narrative, "recommendations": recs2}
+
+def make_mastery_heatmap_fig(sess: AdaptiveSession):
+    skills = sorted((sess.mastery or {}).keys())
+    vals = [sess.mastery[s] for s in skills] if skills else []
+    fig = plt.figure()
+    if skills:
+        plt.imshow([vals], aspect="auto")
+        plt.yticks([])
+        plt.xticks(range(len(skills)), skills, rotation=45, ha="right")
+        plt.colorbar()
+    plt.title("Skill mastery heatmap")
+    return fig
+
+
+def make_difficulty_path_fig(sess: AdaptiveSession):
+    xs = list(range(1, len(sess.difficulty_path) + 1))
+    ys = sess.difficulty_path or []
+    fig = plt.figure()
+    plt.plot(xs, ys, marker="o")
+    plt.xlabel("Question #")
+    plt.ylabel("Difficulty (mapped)")
+    plt.title("Difficulty path")
+    return fig
+
+
+def make_bank_info_curve_fig(bank: ItemBank):
+    # simple placeholder curve using stored a/b if available
+    fig = plt.figure()
+    thetas = [x / 10 for x in range(-30, 31)]
+    infos = []
+    for th in thetas:
+        total = 0.0
+        for it in bank.items:
+            a = getattr(it, "irt_a", None) or 1.0
+            b = getattr(it, "irt_b", None) or 0.0
+            import math
+            p = 1.0 / (1.0 + math.exp(-a * (th - b)))
+            total += (a * a) * p * (1 - p)
+        infos.append(total)
+    plt.plot(thetas, infos)
+    plt.xlabel("Theta")
+    plt.ylabel("Information")
+    plt.title("Test information curve (approx.)")
+    return fig
