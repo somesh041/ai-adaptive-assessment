@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data outputs
+data/itembank_*.json
+data/sessions/*.json
+
+# OS
+.DS_Store
+Thumbs.db
