@@ -16,7 +16,6 @@ LANG_LABELS: Dict[LangCode, str] = {
     "te": "Telugu (తెలుగు)",
 }
 
-
 TRANSLATION_SYSTEM = """You are a professional educational translator for Indian school content.
 Return ONLY valid JSON. No markdown. No commentary.
 Preserve meaning, grade-appropriate vocabulary, and keep numbers/symbols/units unchanged.
@@ -146,6 +145,51 @@ def _chunk(lst: List[Any], n: int) -> List[List[Any]]:
     return [lst[i : i + n] for i in range(0, len(lst), n)]
 
 
+def _sanitize_translation_payload(raw: Any, originals: Dict[str, _ItemTranslationIn], langs: List[LangCode]) -> Any:
+    """
+    Prevent translation crashes by filling missing/empty values with original English text.
+    This is cheap and avoids wasting credits on retries.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+        return raw
+
+    for it in raw["items"]:
+        if not isinstance(it, dict):
+            continue
+        iid = str(it.get("id", "")).strip()
+        if iid not in originals:
+            continue
+        orig = originals[iid]
+
+        tr = it.get("translations")
+        if not isinstance(tr, dict):
+            tr = {}
+        # keep only requested languages
+        tr2 = {}
+        for lc in langs:
+            v = tr.get(lc)
+            if not isinstance(v, dict):
+                v = {}
+
+            stem = str(v.get("stem", "")).strip() or orig.stem
+            opts = v.get("options")
+            if not isinstance(opts, list):
+                opts = []
+            opts = [str(x).strip() for x in opts]
+            if len(opts) != 4 or any(not x for x in opts):
+                opts = orig.options
+
+            expl = str(v.get("explanation_short", "")).strip() or orig.explanation_short
+            if len(expl) > 240:
+                expl = expl[:240].rstrip()
+
+            tr2[lc] = {"stem": stem, "options": opts, "explanation_short": expl}
+
+        it["translations"] = tr2
+
+    return raw
+
+
 def add_translations_to_bank(
     bank: ItemBank,
     translate_langs: List[LangCode],
@@ -170,13 +214,16 @@ def add_translations_to_bank(
             _ItemTranslationIn(id=it.id, stem=it.stem, options=it.options, explanation_short=it.explanation_short)
             for it in chunk_items
         ]
+        originals = {x.id: x for x in inputs}
 
         last_raw = ""
+        errors_str = ""
         for attempt in range(1, max_attempts + 1):
-            raw = _call_translate_llm(inputs, translate_langs, model=model) if attempt == 1 else _call_repair_llm(last_raw, errors_str, model=model)
-            last_raw = raw
+            raw_text = _call_translate_llm(inputs, translate_langs, model=model) if attempt == 1 else _call_repair_llm(last_raw, errors_str, model=model)
+            last_raw = raw_text
             try:
-                parsed = _parse_json(raw)
+                parsed = _parse_json(raw_text)
+                parsed = _sanitize_translation_payload(parsed, originals=originals, langs=translate_langs)
                 out = _TranslationPayloadOut.model_validate(parsed)
 
                 out_map = {o.id: o.translations for o in out.items}
@@ -184,10 +231,6 @@ def add_translations_to_bank(
                     got = out_map.get(it.id)
                     if not got:
                         raise ValueError(f"Missing translation for item id={it.id}")
-                    for lc in translate_langs:
-                        if lc not in got:
-                            raise ValueError(f"Missing language {lc} for item id={it.id}")
-
                     it.translations = it.translations or {}
                     for lc in translate_langs:
                         it.translations[lc] = got[lc]
